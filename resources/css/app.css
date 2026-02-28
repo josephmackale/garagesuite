@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =========================================================
+   Core helpers
+   ========================================================= */
+
+/* Prevent Alpine flashes */
+[x-cloak] {
+    display: none !important;
+}
+
+/* Normalize button inputs */
+input:where([type=button]),
+input:where([type=reset]),
+input:where([type=submit]) {
+    background-color: transparent;
+}
+
+/* =========================================================
+   GarageSuite Dark Mode Bridge (DROP-IN FIX)
+   This makes existing light-only Tailwind utilities
+   render correctly when <html class="dark"> is present.
+   ========================================================= */
+
+@layer base {
+    .dark {
+        color-scheme: dark;
+    }
+}
+
+@layer utilities {
+
+    /* -------- Backgrounds -------- */
+    .dark .bg-white {
+        @apply bg-slate-900;
+    }
+
+    .dark .bg-gray-50 {
+        @apply bg-slate-950;
+    }
+
+    .dark .bg-gray-100 {
+        @apply bg-slate-950;
+    }
+
+    /* -------- Borders -------- */
+    .dark .border-gray-100 {
+        @apply border-slate-800;
+    }
+
+    .dark .border-gray-200 {
+        @apply border-slate-800;
+    }
+
+    .dark .border-gray-300 {
+        @apply border-slate-700;
+    }
+
+    /* -------- Text -------- */
+    .dark .text-gray-900 {
+        @apply text-slate-100;
+    }
+
+    .dark .text-gray-800 {
+        @apply text-slate-100;
+    }
+
+    .dark .text-gray-700 {
+        @apply text-slate-200;
+    }
+
+    .dark .text-gray-600 {
+        @apply text-slate-300;
+    }
+
+    .dark .text-gray-500 {
+        @apply text-slate-400;
+    }
+
+    .dark .text-gray-400 {
+        @apply text-slate-500;
+    }
+
+    /* -------- Dividers -------- */
+    .dark .divide-gray-100> :not([hidden])~ :not([hidden]) {
+        @apply divide-slate-800;
+    }
+
+    .dark .divide-gray-200> :not([hidden])~ :not([hidden]) {
+        @apply divide-slate-800;
+    }
+
+    /* -------- Shadows (optional, looks cleaner on dark) -------- */
+    .dark .shadow,
+    .dark .shadow-sm,
+    .dark .shadow-md,
+    .dark .shadow-lg {
+        @apply shadow-none;
+    }
+}

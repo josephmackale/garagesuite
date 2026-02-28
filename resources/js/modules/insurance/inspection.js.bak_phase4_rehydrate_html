@@ -1,0 +1,859 @@
+// resources/js/modules/insurance/inspection.js
+//
+// ✅ Touches only relevant code:
+// - Adds jobId hydration (so we can rehydrate quotation card after completion)
+// - After successful markComplete(): fetches /jobs/{job}/insurance/quotation-card and swaps HTML into #insurance-quotation-card
+// - Keeps everything else untouched (vault hooks, upload interceptor, counters, guardrails, etc.)
+//
+// IMPORTANT (Blade requirements):
+// 1) Quotation card container:
+//    <div id="insurance-quotation-card">@include('jobs.insurance.quotation.card', ...)</div>
+//
+// 2) Inspection mount config MUST pass:
+//    jobId: @js($job->id)
+
+(function () {
+  // Provide the two global hooks used by x-html injected Vault grid.
+  if (!window.__vaultToggle) {
+    window.__vaultToggle = function (id) {
+      const n = parseInt(id, 10);
+      if (!n) return;
+      window.dispatchEvent(new CustomEvent('vault:toggle', { detail: { id: n } }));
+    };
+  }
+
+  // Your grid is calling __vaultSelect({id, url})
+  if (!window.__vaultSelect) {
+    window.__vaultSelect = function (payload) {
+      const id = parseInt(payload?.id, 10);
+      if (!id) return;
+      window.dispatchEvent(new CustomEvent('vault:toggle', { detail: { id, url: payload?.url || '' } }));
+    };
+  }
+
+  function insuranceInspectionModule(cfg) {
+    
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+    const isJsonResponse = (res) => (res.headers.get('content-type') || '').includes('application/json');
+
+    const safeJson = async (res) => {
+      if (!isJsonResponse(res)) {
+        const text = await res.text().catch(() => '');
+        return { ok: false, message: 'Unexpected server response (not JSON).', _raw: text };
+      }
+      return await res.json().catch(() => ({ ok: false, message: 'Invalid JSON response.' }));
+    };
+
+    const nowStamp = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    return {
+      // URLs
+      saveUrl: cfg.saveUrl,
+      completeUrl: cfg.completeUrl,
+      vaultUrl: cfg.vaultUrl,
+      attachUrl: cfg.attachUrl,
+
+      // ✅ Job (needed for rehydrate after completion)
+      jobId: cfg.jobId,
+
+      // State
+      locked: !!cfg.locked,
+
+      minPhotos: Number.isFinite(+cfg.minPhotos) ? +cfg.minPhotos : 4,
+      totalItems: Number.isFinite(+cfg.totalItems) ? +cfg.totalItems : 58,
+
+      // ✅ hydrate from blade (photos + checklist)
+      attached: Array.isArray(cfg.attached) ? cfg.attached : [],
+      photosCount: (Array.isArray(cfg.attached) && cfg.attached.length)
+        ? cfg.attached.length
+        : (Number.isFinite(+cfg.photosCount) ? +cfg.photosCount : 0),
+
+      // ✅ IMPORTANT: blade passes doneCount; module uses doneItems everywhere
+      doneItems: Number.isFinite(+cfg.doneCount) ? +cfg.doneCount : 0,
+
+      changes: cfg.changes ?? 0,
+
+      checklistOpen: false,
+      saving: false,
+      completing: false,
+
+      // ✅ Progress helpers used by UI (percent + bar width)
+      photosProgressPct() {
+        const min = Number(this.minPhotos || 4);
+        const c = Number(this.photosCount || (this.attached?.length || 0));
+        if (!min) return 100;
+        return Math.min(100, Math.round((Math.min(c, min) / min) * 100));
+      },
+
+      checklistProgressPct() {
+        const total = Number(this.totalItems || 58);
+        const done = Number(this.doneItems || 0);
+        if (!total) return 100;
+        return Math.min(100, Math.round((Math.min(done, total) / total) * 100));
+      },
+
+      progressPct() {
+        // ✅ If inspection is locked/completed, show full progress
+        if (this.locked || this.status === 'completed') {
+          return 100;
+        }
+
+        const minPhotos = Number(this.minPhotos || 4);
+        const totalItems = Number(this.totalItems || 58);
+
+        const photosDone = Math.min(
+          Number(this.photosCount || (this.attached?.length || 0)),
+          minPhotos
+        );
+
+        const checklistDone = Math.min(Number(this.doneItems || 0), totalItems);
+
+        const totalUnits = minPhotos + totalItems;
+        if (!totalUnits) return 0;
+
+        return Math.round(((photosDone + checklistDone) / totalUnits) * 100);
+      },
+
+      // Header toast (Blade expects toast.show/message)
+      toast: { show: false, type: 'success', message: '' },
+      showToast(type, message) {
+        this.toast.type = type || 'success';
+        this.toast.message = message || '';
+        this.toast.show = true;
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => (this.toast.show = false), 3500);
+      },
+
+      // Sticky notice (inside checklist card)
+      notice: { show: false, type: 'success', title: '', message: '' },
+      setNotice(type, title, message) {
+        this.notice.type = type;
+        this.notice.title = title;
+        this.notice.message = message;
+        this.notice.show = true;
+
+        const t = type === 'error' ? 'error' : 'success';
+        const msg = `${title}${message ? ': ' + message : ''}`;
+        this.showToast(t, msg);
+      },
+      clearNotice() {
+        this.notice.show = false;
+      },
+
+      // Vault state
+      vault: {
+        open: false,
+        loading: false,
+        html: '',
+        q: '',
+        selectedIds: [],
+        allSelected: false,
+        attaching: false,
+      },
+
+      async openVault() {
+        if (this.locked) return;
+        this.vault.open = true;
+        this.vault.selectedIds = [];
+        this.vault.allSelected = false;
+        await this.loadVaultGrid();
+      },
+
+      closeVault() {
+        this.vault.open = false;
+        this.vault.selectedIds = [];
+        this.vault.allSelected = false;
+      },
+
+      async loadVaultGrid() {
+        this.vault.loading = true;
+
+        try {
+          const url = new URL(this.vaultUrl, window.location.origin);
+          if (this.vault.q) url.searchParams.set('q', this.vault.q);
+
+          const res = await fetch(url.toString(), {
+            headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+            credentials: 'same-origin',
+          });
+
+          const data = await safeJson(res);
+
+          if (!res.ok || !data.html) {
+            this.vault.html = "<div class='text-sm text-rose-600'>Failed to load vault.</div>";
+          } else {
+            this.vault.html = data.html || '';
+          }
+        } catch (e) {
+          this.vault.html = "<div class='text-sm text-rose-600'>Failed to load vault.</div>";
+        } finally {
+          this.vault.loading = false;
+          this.$nextTick(() => this.applyVaultSelectionUI());
+        }
+      },
+
+      applyVaultSelectionUI() {
+        const root = this.$el;
+        root.querySelectorAll('.vault-thumb').forEach((el) => el.classList.remove('is-selected'));
+        this.vault.selectedIds.forEach((id) => {
+          const el = root.querySelector(`.vault-thumb[data-media-id='${id}']`);
+          if (el) el.classList.add('is-selected');
+        });
+      },
+
+      toggleVault(id) {
+        id = parseInt(id, 10);
+        if (!id) return;
+
+        const idx = this.vault.selectedIds.indexOf(id);
+        if (idx >= 0) this.vault.selectedIds.splice(idx, 1);
+        else this.vault.selectedIds.push(id);
+
+        this.applyVaultSelectionUI();
+      },
+
+      toggleSelectAllVisible() {
+        const root = this.$el;
+        const visibleIds = Array.from(root.querySelectorAll('.vault-thumb[data-media-id]'))
+          .map((el) => parseInt(el.getAttribute('data-media-id') || '0', 10))
+          .filter(Boolean);
+
+        if (!visibleIds.length) return;
+
+        const allVisibleSelected = visibleIds.every((id) => this.vault.selectedIds.includes(id));
+
+        if (allVisibleSelected) {
+          this.vault.selectedIds = this.vault.selectedIds.filter((id) => !visibleIds.includes(id));
+        } else {
+          visibleIds.forEach((id) => {
+            if (!this.vault.selectedIds.includes(id)) this.vault.selectedIds.push(id);
+          });
+        }
+
+        this.applyVaultSelectionUI();
+      },
+
+      // ✅ Attach selected
+      async attachSelected() {
+        if (!this.vault.selectedIds.length || this.vault.attaching) return;
+
+        this.vault.attaching = true;
+
+        try {
+          const res = await fetch(this.attachUrl, {
+            method: 'POST',
+            headers: {
+              'X-Requested-With': 'XMLHttpRequest',
+              'X-CSRF-TOKEN': csrf,
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+              media_item_ids: this.vault.selectedIds,
+            }),
+          });
+
+          const data = await safeJson(res);
+
+          if (!res.ok || !data.ok) {
+            if (res.status === 422 && data?.errors) {
+              const firstKey = Object.keys(data.errors)[0];
+              const firstMsg = firstKey ? (data.errors[firstKey]?.[0] || '') : '';
+              this.setNotice('error', 'Validation failed', firstMsg || data.message || 'Invalid data.');
+            } else {
+              this.setNotice('error', 'Error', (data.message || `Could not complete (${res.status}).`) + ' • ' + nowStamp());
+            }
+            return;
+          }
+
+          // ✅ always update attached first
+          if (Array.isArray(data.attached)) this.attached = data.attached;
+
+          // ✅ read server count if present
+          const serverPhotos =
+            (typeof data.photos_count !== 'undefined') ? (parseInt(data.photos_count, 10) || 0) :
+            (typeof data.photosCount !== 'undefined') ? (parseInt(data.photosCount, 10) || 0) :
+            null;
+
+          // ✅ never downgrade below current known attachments
+          if (serverPhotos !== null) {
+            this.photosCount = Math.max(this.photosCount || 0, serverPhotos || 0, (this.attached?.length || 0));
+          } else {
+            this.photosCount = Math.max(this.photosCount || 0, (this.attached?.length || 0));
+          }
+
+          this.setNotice('success', 'Updated', 'Photo attached. • ' + nowStamp());
+
+          this.vault.selectedIds = [];
+          this.vault.allSelected = false;
+
+          this.closeVault();
+
+          // show photos panel after attach
+          this.openPhotos = true;
+          this.openChecklist = false;
+        } catch (e) {
+          this.setNotice('error', 'Error', 'Failed to attach photo.' + ' • ' + nowStamp());
+        } finally {
+          this.vault.attaching = false;
+        }
+      },
+
+      async saveInspection(closeAfter = false) {
+        if (this.locked || this.saving) return;
+
+        this.saving = true;
+
+        try {
+          const root = this.$refs?.inspectionForm;
+          if (!root) {
+            this.setNotice('error', 'Error', 'Save failed: inspection form not found. • ' + nowStamp());
+            return;
+          }
+
+          const formData = new FormData();
+          if (csrf) formData.append('_token', csrf);
+
+          root.querySelectorAll('input[name]').forEach((el) => {
+            if (el.type === 'radio') {
+              if (el.checked) formData.append(el.name, el.value);
+            } else {
+              formData.append(el.name, el.value ?? '');
+            }
+          });
+
+          const res = await fetch(this.saveUrl, {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-TOKEN': csrf, Accept: 'application/json' },
+            credentials: 'same-origin',
+            body: formData,
+          });
+
+          const data = await safeJson(res);
+
+          if (!res.ok || !data.ok) {
+            if (res.status === 422 && data?.errors) {
+              const firstKey = Object.keys(data.errors)[0];
+              const firstMsg = firstKey ? (data.errors[firstKey]?.[0] || '') : '';
+              this.setNotice('error', 'Validation failed', firstMsg || data.message || 'Invalid data.');
+            } else {
+              this.setNotice('error', 'Error', (data.message || `Could not complete (${res.status}).`) + ' • ' + nowStamp());
+            }
+            return;
+          }
+
+          if (typeof data.changes !== 'undefined') this.changes = parseInt(data.changes, 10) || 0;
+
+          // ✅ always update attached first
+          if (Array.isArray(data.attached)) this.attached = data.attached;
+
+          // ✅ read server count if present
+          const serverPhotos =
+            (typeof data.photos_count !== 'undefined') ? (parseInt(data.photos_count, 10) || 0) :
+            (typeof data.photosCount !== 'undefined') ? (parseInt(data.photosCount, 10) || 0) :
+            null;
+
+          // ✅ never downgrade below current known attachments
+          if (serverPhotos !== null) {
+            this.photosCount = Math.max(this.photosCount || 0, serverPhotos || 0, (this.attached?.length || 0));
+          } else {
+            this.photosCount = Math.max(this.photosCount || 0, (this.attached?.length || 0));
+          }
+
+          this.setNotice('success', 'Saved', (data.message || 'Inspection saved.') + ' • ' + nowStamp());
+
+          if (closeAfter) this.checklistOpen = false;
+        } catch (e) {
+          this.setNotice('error', 'Error', 'Save failed.' + ' • ' + nowStamp());
+        } finally {
+          this.saving = false;
+          // ✅ Safety: never leave the UI stuck disabled after Save Draft
+          this.savingChecklist = false;
+          this.completing = false;
+        }
+      },
+
+      async markComplete() {
+        if (this.locked || this.completing) return;
+        this.showToast?.('success', `DEBUG: photos=${this.photosCount}/${this.minPhotos} checklist=${this.doneItems}/${this.totalItems}`);
+
+        // ✅ guardrails (use current state, not cfg)
+        const currentPhotos = (this.attached?.length || this.photosCount || 0);
+
+        if (currentPhotos < (this.minPhotos ?? 4)) {
+          this.setNotice('error', 'Error', 'Add the minimum required photos first.');
+          return;
+        }
+
+        if ((this.doneItems ?? 0) < (this.totalItems ?? 58)) {
+          this.setNotice('error', 'Error', 'Complete all checklist items first.');
+          return;
+        }
+
+        this.completing = true;
+
+        try {
+          if (typeof this.saveChecklist === 'function') {
+            const ok = await this.saveChecklist();
+            if (!ok) return;
+          }
+
+          const res = await fetch(this.completeUrl, {
+            method: 'POST',
+            headers: {
+              'X-Requested-With': 'XMLHttpRequest',
+              'X-CSRF-TOKEN': csrf,
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({}),
+          });
+
+          const data = await safeJson(res);
+
+          if (!res.ok || !data.ok) {
+            if (res.status === 422 && data?.errors) {
+              const firstKey = Object.keys(data.errors)[0];
+              const firstMsg = firstKey ? (data.errors[firstKey]?.[0] || '') : '';
+              this.setNotice('error', 'Validation failed', firstMsg || data.message || 'Invalid data.');
+            } else {
+              this.setNotice('error', 'Error', (data.message || `Could not complete (${res.status}).`) + ' • ' + nowStamp());
+            }
+            return;
+          }
+
+          this.locked = true;
+          this.openPhotos = false;
+          this.openChecklist = true;
+
+          this.setNotice('success', 'Completed', (data.message || 'Inspection completed and locked.') + ' • ' + nowStamp());
+
+          // ✅ NEW: Server rehydrate quotation card so unlock reflects instantly (no full reload)
+          try {
+            const container = document.getElementById('insurance-quotation-card');
+            if (container && this.jobId) {
+              const res2 = await fetch(`/jobs/${this.jobId}/insurance/quotation-card`, {
+                headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' },
+                credentials: 'same-origin',
+              });
+
+              const data2 = await res2.json().catch(() => ({}));
+              if (res2.ok && data2 && typeof data2.html === 'string') {
+                container.innerHTML = data2.html;
+
+                // ✅ Alpine re-init for swapped HTML
+                if (window.Alpine && typeof window.Alpine.initTree === 'function') {
+                  window.Alpine.initTree(container);
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('Quotation card rehydrate failed', e);
+          }
+        } catch (e) {
+          console.error(e);
+          this.setNotice('error', 'Error', 'Could not complete.' + ' • ' + nowStamp());
+        } finally {
+          this.completing = false;
+        }
+      },
+
+      init() {
+        this._onVaultToggle = (e) => {
+          if (!this.vault.open) return;
+          const id = e.detail?.id;
+          if (!id) return;
+          this.toggleVault(id);
+        };
+        window.addEventListener('vault:toggle', this._onVaultToggle);
+      },
+
+      destroy() {
+        if (this._onVaultToggle) window.removeEventListener('vault:toggle', this._onVaultToggle);
+      },
+    };
+  }
+
+  // Export into window via named export pattern in app.js
+  window.__insuranceInspectionModuleExport = insuranceInspectionModule;
+
+  /**
+   * Insurance Inspection Alpine Component
+   * Extracted from inline x-data (safe version)
+   */
+  function insuranceInspectionCard(cfg) {
+    const m = insuranceInspectionModule({
+      saveUrl: cfg.saveUrl,
+      completeUrl: cfg.completeUrl,
+      vaultUrl: cfg.vaultUrl,
+      attachUrl: cfg.attachUrl,
+
+      // ✅ NEW: pass jobId through
+      jobId: cfg.jobId,
+
+      locked: cfg.locked,
+      minPhotos: cfg.minPhotos ?? 4,
+      totalItems: cfg.totalItems ?? 58,
+
+      photosCount: cfg.photosCount ?? 0,
+      doneCount: cfg.doneCount ?? 0, // ✅ hydrate into doneItems
+
+      attached: cfg.attached ?? [],
+    });
+
+    /* -------------------------
+      Base UI State
+    --------------------------*/
+
+    m.checklistLoadUrl = cfg.checklistLoadUrl;
+    m.detachUrl = cfg.detachUrl;
+    m.checklistSaveUrl = cfg.checklistSaveUrl;
+
+    m.openPhotos = false;
+    m.openChecklist = false;
+    m.openAllPhotos = false;
+
+    m.checklistItems = cfg.checklistItems ?? {};
+    m.checklist = {};
+    m.checklistLoaded = false;
+
+    // ✅ start from server-hydrated count
+    m.doneItems = Number.isFinite(+cfg.doneCount) ? +cfg.doneCount : (m.doneItems ?? 0);
+
+    m.savingChecklist = false;
+    m.detachingId = null;
+
+    /* -------------------------
+      Sections
+    --------------------------*/
+
+    m.sections = [
+      { key: 's1', title: 'Items 1–20', from: 1, to: 20, open: true },
+      { key: 's2', title: 'Items 21–40', from: 21, to: 40, open: false },
+      { key: 's3', title: 'Items 41–58', from: 41, to: 58, open: false },
+    ];
+
+    /* -------------------------
+      Defaults
+    --------------------------*/
+
+    Object.keys(m.checklistItems).forEach((id) => {
+      const k = String(id);
+      if (!m.checklist[k]) {
+        m.checklist[k] = { status: null, note: '' };
+      }
+    });
+
+    /* -------------------------
+      Counters
+    --------------------------*/
+
+    m.recalcDone = function () {
+      let n = 0;
+      for (const k in this.checklist) {
+        if (this.checklist[k]?.status) n++;
+      }
+      this.doneItems = n;
+      // ✅ keep progress correct
+      if (typeof this.recalcProgress === 'function') {
+        this.recalcProgress();
+      }
+    };
+
+    /* -------------------------
+      Status Setter
+    --------------------------*/
+
+    m.setStatus = function (id, status) {
+      if (this.locked) return;
+
+      const k = String(id);
+      if (!this.checklist[k]) {
+        this.checklist[k] = { status: null, note: '' };
+      }
+
+      this.checklist[k].status = status;
+      this.recalcDone();
+    };
+
+    /* -------------------------
+      Progress (reuse module % calculation but keep your label)
+    --------------------------*/
+
+    m.progressPctLabel = 0;
+
+    m.recalcProgress = function () {
+      // ✅ Use the unified helpers from module
+      const pct = typeof this.progressPct === 'function' ? this.progressPct() : 0;
+      this.progressPctLabel = Math.max(0, Math.min(100, pct));
+    };
+
+    /* -------------------------
+      Detach Photo
+    --------------------------*/
+
+    m.detachPhoto = async function (mediaItemId) {
+      if (this.locked) return;
+
+      const csrf2 = document.querySelector('meta[name="csrf-token"]')?.content;
+
+      this.detachingId = mediaItemId;
+
+      try {
+        const res = await fetch(this.detachUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-TOKEN': csrf2,
+            Accept: 'application/json',
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            media_item_id: mediaItemId,
+          }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok || !data?.ok) {
+          this.showToast?.('error', data?.message || 'Failed to remove photo.');
+          return;
+        }
+
+        if (Array.isArray(data.attached)) {
+          this.attached = data.attached;
+        }
+
+        const serverPhotos =
+          (typeof data.photos_count === 'number') ? data.photos_count :
+          (typeof data.photosCount === 'number') ? data.photosCount :
+          null;
+
+        if (serverPhotos !== null) {
+          this.photosCount = Math.max(this.photosCount || 0, serverPhotos || 0, (this.attached?.length || 0));
+        } else {
+          this.photosCount = Math.max(this.photosCount || 0, (this.attached?.length || 0));
+        }
+
+        this.recalcProgress();
+        this.showToast?.('success', 'Photo removed.');
+      } catch (e) {
+        console.error(e);
+        this.showToast?.('error', 'Failed to remove photo.');
+      } finally {
+        this.detachingId = null;
+      }
+    };
+
+    /* -------------------------
+      Load Checklist
+    --------------------------*/
+    m.loadChecklist = async function () {
+      if (this.checklistLoaded) return;
+
+      try {
+        const res = await fetch(this.checklistLoadUrl, {
+          headers: { Accept: 'application/json' },
+          credentials: 'same-origin',
+        });
+
+        const data = await res.json();
+
+        if (!data?.ok) return;
+        this.checklistLoaded = true;
+
+        if (data.items) {
+          this.checklist = data.items;
+        }
+
+        Object.keys(this.checklistItems).forEach((id) => {
+          const k = String(id);
+
+          if (!this.checklist[k]) {
+            this.checklist[k] = { status: null, note: '' };
+          }
+
+          if (this.checklist[k].status === undefined && this.checklist[k].state !== undefined) {
+            this.checklist[k].status = this.checklist[k].state;
+          }
+
+          if (this.checklist[k].note === undefined && this.checklist[k].notes !== undefined) {
+            this.checklist[k].note = this.checklist[k].notes;
+          }
+        });
+
+        if (typeof data.doneItems === 'number') {
+          this.doneItems = data.doneItems;
+        } else if (typeof data.doneCount === 'number') {
+          this.doneItems = data.doneCount;
+        } else {
+          this.recalcDone();
+        }
+
+        // ✅ never let checklist load reduce photo count (draft already knows attachments)
+        const serverPhotos =
+          (typeof data.photosCount === 'number') ? data.photosCount :
+          (typeof data.photos_count === 'number') ? data.photos_count :
+          null;
+
+        if (serverPhotos !== null) {
+          this.photosCount = Math.max(this.photosCount || 0, serverPhotos || 0, (this.attached?.length || 0));
+        } else {
+          this.photosCount = Math.max(this.photosCount || 0, (this.attached?.length || 0));
+        }
+
+        this.recalcProgress();
+      } catch (e) {
+        console.error('loadChecklist failed', e);
+      }
+    };
+
+    /* -------------------------
+      Save Checklist
+    --------------------------*/
+
+    m.saveChecklist = async function () {
+      if (this.locked) return false;
+
+      const csrf2 = document.querySelector('meta[name="csrf-token"]')?.content;
+
+      const itemsPayload = {};
+      for (const k in this.checklist) {
+        const row = this.checklist[k] || {};
+        itemsPayload[k] = {
+          state: row.status || null,
+          notes: (row.note || '').trim() || null,
+        };
+      }
+
+      this.savingChecklist = true;
+
+      try {
+        const res = await fetch(this.checklistSaveUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-TOKEN': csrf2,
+            Accept: 'application/json',
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify({ items: itemsPayload }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        this.showToast?.('success', `DBG saveChecklist: server photos_count=${data.photos_count} photosCount=${data.photosCount} attached_len=${(data.attached?.length ?? 'NA')}`);
+
+        if (!res.ok || !data?.ok) {
+          this.showToast?.('error', data?.message || 'Failed to save checklist.');
+          return false;
+        }
+
+        if (typeof data.photos_count === 'number') this.photosCount = data.photos_count;
+        if (typeof data.photosCount === 'number') this.photosCount = data.photosCount;
+
+        // ✅ if backend returns doneItems/doneCount, trust it; else recompute
+        if (typeof data.doneItems === 'number') this.doneItems = data.doneItems;
+        else if (typeof data.doneCount === 'number') this.doneItems = data.doneCount;
+        else this.recalcDone();
+
+        this.recalcProgress();
+
+        this.showToast?.('success', 'Checklist saved.');
+        return true;
+      } catch (e) {
+        console.error('saveChecklist failed', e);
+        this.showToast?.('error', 'Failed to save checklist.');
+        return false;
+      } finally {
+        this.savingChecklist = false;
+      }
+    };
+
+    /* -------------------------
+      Init
+    --------------------------*/
+
+    // ✅ If we are locked, we may never load checklist; keep accurate server progress
+    m.recalcProgress();
+
+    return m;
+  }
+
+  window.insuranceInspectionCard = insuranceInspectionCard;
+})();
+
+// ✅ Vault upload interceptor (leave as-is)
+document.addEventListener(
+  'submit',
+  async (e) => {
+    const form =
+      e.submitter?.closest?.('[data-vault-upload-form]') || e.target?.closest?.('[data-vault-upload-form]');
+
+    if (!form) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation?.();
+
+    const input =
+      form.querySelector('[data-vault-upload-input]') || form.querySelector('input[type="file"][name="photo"]');
+
+    const file = input?.files?.[0];
+    if (!file) return;
+
+    const fd = new FormData(form);
+
+    const btn = form.querySelector('button[type="submit"]');
+    const old = btn ? btn.textContent : null;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Uploading…';
+    }
+
+    try {
+      const res = await fetch(form.action, {
+        method: 'POST',
+        body: fd,
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+          Accept: 'application/json,text/html',
+        },
+        credentials: 'same-origin',
+      });
+
+      const ct = res.headers.get('content-type') || '';
+      if (!res.ok) {
+        const err = ct.includes('application/json') ? await res.json() : await res.text();
+        console.error('Vault upload failed:', err);
+        return;
+      }
+
+      if (ct.includes('application/json')) {
+        const data = await res.json();
+        if (data && typeof data.html === 'string') {
+          const wrap = form.closest('[data-vault-picker]');
+          if (wrap) wrap.outerHTML = data.html;
+        } else {
+          document.dispatchEvent(new CustomEvent('vault:refresh'));
+        }
+      } else {
+        const html = await res.text();
+        const wrap = form.closest('[data-vault-picker]');
+        if (wrap) wrap.outerHTML = html;
+      }
+
+      if (input) input.value = '';
+    } catch (err) {
+      console.error('Vault upload error:', err);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        if (old != null) btn.textContent = old;
+      }
+    }
+  },
+  true
+);

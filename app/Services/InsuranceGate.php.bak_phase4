@@ -1,0 +1,263 @@
+<?php
+// app/Services/InsuranceGate.php
+
+namespace App\Services;
+
+use App\Models\Job;
+use Illuminate\Support\Str;
+
+class InsuranceGate
+{
+    public function forJob(\App\Models\Job $job): array
+    {
+        // Canonical approval status — ONLY approval_packs table
+        $packStatus = \App\Models\ApprovalPack::query()
+            ->where('job_id', $job->id)
+            ->orderByDesc('id')
+            ->value('status') ?: 'draft';
+
+        // Back-compat normalization if legacy ever existed
+        if ($packStatus === 'pending') $packStatus = 'submitted';
+
+        return [
+            'is_insurance' => $this->isInsurance($job),
+
+            'inspection_started'  => $this->inspectionStarted($job),
+            'inspection_complete' => $this->inspectionComplete($job),
+
+            'quote_submitted' => $this->quoteSubmitted($job),
+
+            // ✅ Canonical approval gate for UI
+            'approval' => [
+                'status' => $packStatus, // draft|submitted|approved|rejected
+            ],
+
+            'repair_started' => $this->repairStarted($job),
+            'has_lpo'        => $this->hasLpo($job),
+
+            // permissions (keep your existing methods)
+            'can_edit_inspection'     => $this->canEditInspection($job),
+            'can_complete_inspection' => $this->canCompleteInspection($job),
+            'can_edit_quote'          => $this->canEditQuote($job),
+            'can_submit_quote'        => $this->canSubmitQuote($job),
+            'can_approve_quote'       => $this->canApproveQuote($job),
+            'can_start_repair'        => $this->canStartRepair($job),
+            'can_invoice'             => $this->canInvoice($job),
+        ];
+    }
+
+    /**
+     * Quick helpers
+     */
+    public function isInsurance(Job $job): bool
+    {
+        return ($job->payer_type ?? null) === 'insurance';
+    }
+
+    public function inspectionStarted(Job $job): bool
+    {
+        // Deterministic: if an inspection row exists, inspection has started
+        return \App\Models\JobInspection::query()
+            ->where('job_id', $job->id)
+            ->exists();
+    }
+
+    public function inspectionComplete(\App\Models\Job $job): bool
+    {
+        return \App\Models\JobInspection::query()
+            ->where('job_id', $job->id)
+            ->where('status', 'completed')
+            ->exists();
+    }
+
+
+
+    public function repairStarted(Job $job): bool
+    {
+        return \App\Models\JobRepair::query()
+            ->where('job_id', $job->id)
+            ->where(function ($q) {
+                $q->whereNotNull('started_at')
+                ->orWhereIn('status', ['started', 'in_progress', 'completed']);
+            })
+            ->exists();
+    }
+
+
+    public function quoteExists(Job $job): bool
+    {
+        // Adjust to your quote/estimate relation/table later
+        return method_exists($job, 'quotes')
+            ? (int) $job->quotes()->count() > 0
+            : (bool) data_get($this->insurance($job), 'quote_id');
+    }
+
+    public function quoteSubmitted(Job $job): bool
+    {
+        return \App\Models\JobQuotation::query()
+            ->where('job_id', $job->id)
+            ->whereNotNull('submitted_at')
+            ->exists();
+    }
+
+
+    public function quoteApproved(Job $job): bool
+    {
+        return \App\Models\ApprovalPack::query()
+            ->where('job_id', $job->id)
+            ->where('status', 'approved')
+            ->exists();
+    }
+
+
+    public function hasLpo(Job $job): bool
+    {
+        $lpo = (string) \App\Models\JobInsuranceDetail::query()
+            ->where('job_id', $job->id)
+            ->value('lpo_number');
+
+        return Str::of($lpo)->trim()->isNotEmpty();
+    }
+
+
+
+    /**
+     * === Core gates ===
+     * Return: ['ok'=>bool, 'reason'=>string, 'code'=>string]
+     */
+    public function canEditInspection(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+        if ($this->repairStarted($job)) return $this->deny('Repair already started. Inspection is locked.', 'inspection.locked.repair_started');
+        if ($this->inspectionComplete($job)) return $this->deny('Inspection is completed and locked.', 'inspection.locked.complete');
+        return $this->ok();
+    }
+
+    public function canCompleteInspection(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        // You already enforce: min 4 photos + checklist completion in the inspection module itself.
+        if ($this->inspectionComplete($job)) return $this->deny('Inspection is already completed.', 'inspection.already_complete');
+        if ($this->repairStarted($job)) return $this->deny('Repair already started. Cannot complete inspection now.', 'inspection.blocked.repair_started');
+
+        return $this->ok();
+    }
+
+    public function canSubmitQuote(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        if (!$this->inspectionComplete($job)) return $this->deny('Complete inspection before submitting a quotation.', 'quote.blocked.no_inspection');
+        if ($this->repairStarted($job)) return $this->deny('Repair already started. Quotation cannot be submitted/changed.', 'quote.locked.repair_started');
+
+        // Optional: require quote exists + has lines at controller level once you implement quotes table
+        return $this->ok();
+    }
+
+    public function canEditQuote(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        // 🔒 Hard lock boundary: once approved, quotation is immutable
+        if ($this->quoteApproved($job)) {
+            return $this->deny('Quotation is locked because approval is already completed.', 'quote.locked.approved');
+        }
+
+        // If repair already started, quotation changes are not allowed
+        if ($this->repairStarted($job)) {
+            return $this->deny('Repair already started. Quotation cannot be edited.', 'quote.locked.repair_started');
+        }
+
+        // Optional: keep your existing flow discipline (edit allowed only after inspection complete)
+        if (!$this->inspectionComplete($job)) {
+            return $this->deny('Complete inspection before editing quotation.', 'quote.blocked.no_inspection');
+        }
+
+        return $this->ok();
+    }
+
+    public function canApproveQuote(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        if (!$this->inspectionComplete($job)) return $this->deny('Complete inspection before approval.', 'approval.blocked.no_inspection');
+        if (!$this->quoteSubmitted($job)) return $this->deny('Quotation must be submitted before approval.', 'approval.blocked.not_submitted');
+        if ($this->repairStarted($job)) return $this->deny('Repair already started. Approval is locked.', 'approval.locked.repair_started');
+
+        return $this->ok();
+    }
+
+    public function canStartRepair(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        if (!$this->inspectionComplete($job)) return $this->deny('Complete inspection before starting repair.', 'repair.blocked.no_inspection');
+        if (!$this->quoteApproved($job)) return $this->deny('Quotation approval required before repair.', 'repair.blocked.not_approved');
+
+        // If repair already started, we treat "start" as no-op (but you can allow continuing work elsewhere)
+        if ($this->repairStarted($job)) return $this->deny('Repair already started.', 'repair.already_started');
+
+        return $this->ok();
+    }
+
+    public function canAddLabourOrParts(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        // Before repair has begun, enforce the "start repair" gate
+        if (!$this->repairStarted($job)) {
+            return $this->canStartRepair($job);
+        }
+
+        // After it has begun, allow continuing (unless you introduce later locks like "completed")
+        return $this->ok();
+    }
+
+    public function canInvoice(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        if (!$this->quoteApproved($job)) return $this->deny('Quotation must be approved before invoicing.', 'invoice.blocked.not_approved');
+        if (!$this->hasLpo($job)) return $this->deny('LPO/Authority number is required before invoicing.', 'invoice.blocked.no_lpo');
+
+        return $this->ok();
+    }
+
+    public function canSwitchPayer(Job $job): array
+    {
+        if (!$this->isInsurance($job)) return $this->ok();
+
+        // Your lock-in: payer type locks after inspection starts
+        if ($this->inspectionStarted($job) || $this->inspectionComplete($job)) {
+            return $this->deny('Payer type is locked after inspection begins.', 'payer.locked.inspection_started');
+        }
+
+        return $this->ok();
+    }
+
+    /**
+     * === Internals ===
+     */
+    protected function insurance(Job $job)
+    {
+        // Adjust if your relation is named differently:
+        // job->insuranceDetails, job->insurance, job->jobInsuranceDetails, etc.
+        if (method_exists($job, 'insuranceDetails')) return $job->insuranceDetails;
+        if (method_exists($job, 'insurance')) return $job->insurance;
+        if (property_exists($job, 'insuranceDetails')) return $job->insuranceDetails;
+        if (property_exists($job, 'insurance')) return $job->insurance;
+
+        return null;
+    }
+
+    protected function ok(): array
+    {
+        return ['ok' => true, 'reason' => '', 'code' => 'ok'];
+    }
+
+    protected function deny(string $reason, string $code): array
+    {
+        return ['ok' => false, 'reason' => $reason, 'code' => $code];
+    }
+}

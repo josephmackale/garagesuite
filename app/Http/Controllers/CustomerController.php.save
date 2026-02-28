@@ -1,0 +1,106 @@
+st $request)
+    {
+        $garageId = Auth::user()->garage_id;
+        $search   = $request->query('q');
+
+        $query = Customer::where('garage_id', $garageId);
+
+        if (!empty($search)) {
+            $like = '%' . $search . '%';
+            $query->where(function ($q) use ($like) {
+                $q->where('name', 'like', $like)
+                  ->orWhere('phone', 'like', $like)
+                  ->orWhere('email', 'like', $like);
+            });
+        }
+
+        $customers = $query->orderBy('created_at', 'desc')
+            ->paginate(20)
+            ->appends(['q' => $search]);
+
+        return view('customers.index', compact('customers', 'search'));
+    }
+
+    /**
+     * Show the form for creating a new customer.
+     */
+    public function create()
+    {
+        return view('customers.create');
+    }
+
+    /**
+     * Store a newly created customer in storage.
+     */
+    public function store(Request $request)
+    {
+        $garageId = Auth::user()->garage_id;
+
+        $validated = $request->validate([
+            'name'    => 'required|string|max:255',
+            'phone'   => 'required|string|max:25',
+            'email'   => 'nullable|email|max:255',
+            'address' => 'nullable|string|max:500',
+        ]);
+
+        $validated['garage_id'] = $garageId;
+
+        Customer::create($validated);
+
+        return redirect()
+            ->route('customers.index')
+            ->with('success', 'Customer added successfully.');
+    }
+
+    /**
+     * Show the form for editing an existing customer.
+     */
+    public function edit($id)
+    {
+        $garageId = Auth::user()->garage_id;
+
+        $customer = Customer::where('garage_id', $garageId)->findOrFail($id);
+
+        return view('customers.edit', compact('customer'));
+    }
+
+    /**
+     * Update the specified customer.
+     */
+    public function update(Request $request, $id)
+    {
+        $garageId = Auth::user()->garage_id;
+
+        $customer = Customer::where('garage_id', $garageId)->findOrFail($id);
+
+        $validated = $request->validate([
+            'name'    => 'required|string|max:255',
+            'phone'   => 'required|string|max:25',
+            'email'   => 'nullable|email|max:255',
+            'address' => 'nullable|string|max:500',
+        ]);
+
+        $customer->update($validated);
+
+        return redirect()
+            ->route('customers.index')
+            ->with('success', 'Customer updated successfully.');
+    }
+
+    /**
+     * Remove the specified customer from storage.
+     */
+    public function destroy($id)
+    {
+        $garageId = Auth::user()->garage_id;
+
+        $customer = Customer::where('garage_id', $garageId)->findOrFail($id);
+
+        $customer->delete();
+
+        return redirect()
+            ->route('customers.index')
+            ->with('success', 'Customer deleted.');
+    }
+}
+
