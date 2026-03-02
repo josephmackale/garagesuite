@@ -1,104 +1,134 @@
 # GarageSuite (iWebGarage)
 
-GarageSuite is a multi-tenant Garage Management System (GMS) built on Laravel.
-It is designed for real-world garage operations in Kenya and similar markets, with
-a strong focus on simplicity, reliability, and operational clarity.
+GarageSuite is a multi-tenant Garage Management System (GMS) built with Laravel,
+designed for real-world automotive operations in emerging markets.
+
+It is architected as a SaaS platform with strict tenant isolation,
+deterministic workflow enforcement, and server-driven state control.
 
 ---
 
-## 🔒 Deployment Information
+## 🎯 The Problem
 
-**Production**
+Many independent garages struggle with:
 
-**Development**
+- Disorganized job tracking
+- Insurance approval misalignment
+- Repair scope drift
+- Poor receivables visibility
+- Shared systems without data isolation
 
-**Server (VPS)**
-46.62.255.138
-
----
-
-## 🧠 System Overview
-
-GarageSuite enables garages to manage daily operations efficiently:
-
-- Multi-tenant garage architecture (garage-scoped data)
-- Customers & vehicles management
-- Jobs / work orders lifecycle
-- Billing & invoicing
-- SMS notifications (system-owned provider)
-- Super Admin control panel
-- Garage-level user roles
-
-The system is built as a **SaaS**, with clear separation between:
-- **Super Admin** (system owner)
-- **Garage Owners & Staff** (tenants)
+GarageSuite was built to solve these using structured relational modeling
+and enforced workflow gates.
 
 ---
 
-## 👥 User Roles
+## 🏗 Core Architecture
+
+### Multi-Tenant Isolation
+
+All domain tables are scoped by `garage_id` to guarantee
+complete tenant separation and prevent cross-garage data leakage.
+
+Tenant context is enforced at the query level.
+
+---
+
+### Deterministic Workflow Engine
+
+Insurance and job workflows follow a strict lifecycle:
+
+Intake → Inspection → Quotation → Approval → Repair → Completion → Settlement
+
+Stages cannot be skipped.
+Unlock logic is computed server-side from database truth.
+
+No client-side “flag unlocking” is trusted.
+
+---
+
+### Approval-Pack Integrity Model
+
+Approved quotations generate immutable approval packs.
+
+Repair sessions clone approved pack items 1:1,
+ensuring:
+
+- No scope modification during execution
+- Traceable decision history
+- Enforcement of insurer-approved tasks only
+
+---
+
+### Server-Driven UI Rehydration
+
+UI components are re-rendered from server partials
+after workflow transitions to ensure:
+
+- No state drift
+- Single source of truth
+- Deterministic frontend behavior
+
+---
+
+## 👥 Role Model
 
 ### Super Admin
 - Manage garages & users
-- Control system-wide settings
-- Configure SMS provider
-- Monitor usage & activity
-- Impersonate garages (support/debug)
+- Configure system-level services (SMS provider)
+- Monitor usage
+- Impersonate tenants for support
 
 ### Garage Owner / Staff
 - Manage customers, vehicles, and jobs
 - Generate invoices
 - Trigger SMS reminders (quota-limited)
-- No access to system infrastructure or APIs
+- No access to infrastructure or provider credentials
 
 ---
 
-## 📩 SMS Architecture (IMPORTANT)
+## 📩 SMS Architecture
 
-- SMS provider is **system-owned**
-- Configured in **Super Admin → Settings**
-- Garages do **not** manage SMS APIs or credits
-- SMS usage is limited by **plan quotas**
-- All SMS messages are fully logged
-- Sender ID & provider credentials are hidden from garages
+- Provider is system-owned
+- Configured centrally (Super Admin only)
+- Garages cannot view or modify credentials
+- Usage is plan-quota enforced
+- All SMS events are logged
 
-This design ensures:
-- Security
-- Cost control
-- Predictable delivery
-- Minimal support overhead
-
----
-
-## 🧾 Billing & Plans (High Level)
-
-- Garages subscribe to plans
-- Plans define limits (e.g. SMS quota)
-- Payments are handled externally
-- System enforces limits automatically
+This ensures operational security and cost control.
 
 ---
 
 ## 🛠 Technology Stack
 
-- **Backend:** Laravel (PHP)
-- **Frontend:** Blade + Tailwind CSS
-- **Database:** MySQL / MariaDB
-- **Queue:** Laravel queue (cron/worker)
-- **Notifications:** SMS Provider API
-- **Server:** Ubuntu VPS
+- Laravel (PHP)
+- MySQL
+- Blade + Alpine.js
+- Tailwind CSS
+- Laravel Queue (cron/worker)
+- Ubuntu VPS deployment
 
 ---
 
-## 🚀 Development Workflow
+## 📌 Project Status
 
-### Recommended
-- Always work on **Development** before Production
-- Use VS Code **Remote SSH** for live editing
-- Keep system-level changes minimal and deliberate
+Active development.
 
-### Useful commands
+Current focus:
+- Insurance workflow hardening
+- Repair session integrity enforcement
+- Receivables engine
+- Reporting & operational dashboards
+
+---
+
+## ⚙ Local Setup
+
 ```bash
-php artisan view:clear
-php artisan route:clear
-php artisan cache:clear
-php artisan config:clear
+git clone https://github.com/josephmackale/garagesuite.git
+cd garagesuite
+composer install
+cp .env.example .env
+php artisan key:generate
+php artisan migrate
+php artisan serve
