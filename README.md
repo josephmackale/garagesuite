@@ -1,124 +1,118 @@
 # GarageSuite (iWebGarage)
 
 GarageSuite is a multi-tenant Garage Management System (GMS) built with Laravel,
-designed for real-world automotive operations in emerging markets.
+designed to model real-world automotive and insurance repair workflows.
 
-It is architected as a SaaS platform with strict tenant isolation,
-deterministic workflow enforcement, and server-driven state control.
-
----
-
-## 🎯 The Problem
-
-Many independent garages struggle with:
-
-- Disorganized job tracking
-- Insurance approval misalignment
-- Repair scope drift
-- Poor receivables visibility
-- Shared systems without data isolation
-
-GarageSuite was built to solve these using structured relational modeling
-and enforced workflow gates.
+It is implemented as a SaaS-style platform focused on deterministic business processes,
+strict tenant isolation, and server-enforced operational rules.
 
 ---
 
-## 🏗 Core Architecture
+## 🚗 Why GarageSuite Exists
 
-### Multi-Tenant Isolation
+Many independent garages operate with fragmented tools:
 
-All domain tables are scoped by `garage_id` to guarantee
-complete tenant separation and prevent cross-garage data leakage.
+- Job tracking lives in notebooks or spreadsheets
+- Insurance approvals lose alignment with actual repairs
+- Scope changes happen without traceability
+- Receivables and follow-ups are difficult to monitor
+- Shared systems risk cross-customer data exposure
 
-Tenant context is enforced at the query level.
+GarageSuite solves this by translating operational reality into structured,
+enforceable software workflows.
+
+---
+
+## 🏗 Key Engineering Concepts
+
+### Multi-Tenant Data Isolation
+
+All domain tables are scoped by `garage_id`, ensuring complete tenant separation.
+
+Every query executes within tenant context to prevent cross-garage data access —
+a core requirement for SaaS safety.
 
 ---
 
 ### Deterministic Workflow Engine
 
-Insurance and job workflows follow a strict lifecycle:
+Jobs follow a strict lifecycle:
 
-Intake → Inspection → Quotation → Approval → Repair → Completion → Settlement
+**Intake → Inspection → Quotation → Approval → Repair → Completion → Settlement**
 
 Stages cannot be skipped.
-Unlock logic is computed server-side from database truth.
 
-No client-side “flag unlocking” is trusted.
+Workflow state is computed exclusively from persisted database truth —
+no client-side flags are trusted.
+
+This prevents premature transitions and guarantees auditability.
 
 ---
 
 ### Approval-Pack Integrity Model
 
-Approved quotations generate immutable approval packs.
+Approved quotations generate immutable **Approval Packs**.
 
-Repair sessions clone approved pack items 1:1,
-ensuring:
+Repair sessions clone approved items 1:1, ensuring:
 
-- No scope modification during execution
+- No execution outside insurer-approved scope
 - Traceable decision history
-- Enforcement of insurer-approved tasks only
+- Locked repair authorization boundaries
 
 ---
 
 ### Server-Driven UI Rehydration
 
-UI components are re-rendered from server partials
-after workflow transitions to ensure:
+After workflow transitions, UI components are re-rendered from server partials to ensure:
 
-- No state drift
+- No frontend state drift
 - Single source of truth
-- Deterministic frontend behavior
+- Predictable behavior after refresh or async actions
 
 ---
 
 ## 👥 Role Model
 
 ### Super Admin
-- Manage garages & users
-- Configure system-level services (SMS provider)
-- Monitor usage
-- Impersonate tenants for support
+- Manages garages and users
+- Configures infrastructure services (e.g., SMS provider)
+- Monitors usage and supports tenants via impersonation
 
-### Garage Owner / Staff
+### Garage Staff
 - Manage customers, vehicles, and jobs
-- Generate invoices
-- Trigger SMS reminders (quota-limited)
-- No access to infrastructure or provider credentials
+- Execute workflow stages
+- Generate invoices and reminders
+- No access to infrastructure credentials
 
 ---
 
-## 📩 SMS Architecture
+## 📩 Centralized SMS Architecture
 
-- Provider is system-owned
-- Configured centrally (Super Admin only)
-- Garages cannot view or modify credentials
-- Usage is plan-quota enforced
-- All SMS events are logged
+SMS providers are configured at system level:
 
-This ensures operational security and cost control.
+- Credentials never exposed to tenants
+- Usage is quota-controlled per garage
+- All SMS activity logged for audit and cost governance
 
 ---
 
 ## 🛠 Technology Stack
 
 - Laravel (PHP)
-- MySQL
+- MySQL (relational workflow modeling)
 - Blade + Alpine.js
 - Tailwind CSS
-- Laravel Queue (cron/worker)
+- Laravel Queues / Cron Workers
 - Ubuntu VPS deployment
 
 ---
 
-## 📌 Project Status
+## 📌 Current Development Focus
 
-Active development.
-
-Current focus:
 - Insurance workflow hardening
-- Repair session integrity enforcement
-- Receivables engine
-- Reporting & operational dashboards
+- Repair-session enforcement
+- Receivables tracking engine
+- Operational reporting dashboards
 
 ---
 
