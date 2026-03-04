@@ -169,6 +169,40 @@ class JobCreateWizardController extends Controller
         $request->session()->put(self::SESSION_KEY, ['draft_uuid' => $d->draft_uuid]);
     }
 
+    private function createFreshDraft(Request $request, bool $keepContext = true): JobDraft
+    {
+        $garageId = auth()->user()->garage_id;
+        $userId   = auth()->id();
+
+        if (empty($garageId)) abort(403, 'Platform Admin must impersonate a garage before creating jobs.');
+
+        // optional: carry context from current draft before nuking
+        $existing = $keepContext ? $this->draft($request) : [];
+
+        // IMPORTANT: drop session pointer so draftUuid() returns null
+        $request->session()->forget(self::SESSION_KEY);
+
+        $draft = JobDraft::create([
+            'garage_id'  => $garageId,
+            'user_id'    => $userId,
+            'draft_uuid' => (string) Str::uuid(),
+            'status'     => 'draft',
+            'last_step'  => 'step1',
+
+            'customer_id' => $keepContext ? ($existing['customer_id'] ?? null) : null,
+            'vehicle_id'  => $keepContext ? ($existing['vehicle_id']  ?? null) : null,
+
+            // hard reset these
+            'payer_type'  => null,
+            'payer'       => [],
+            'details'     => [],
+            'job_id'      => null,
+        ]);
+
+        $request->session()->put(self::SESSION_KEY, ['draft_uuid' => $draft->draft_uuid]);
+
+        return $draft;
+    }
 
     private function isModal(Request $request): bool
     {
@@ -304,12 +338,21 @@ class JobCreateWizardController extends Controller
     */
     public function step1(Request $request): View
     {
-        $this->persistContext($request);
-
-        // If user is opening Step 1, treat as a new wizard session unless explicitly continuing
-        if (!$request->boolean('resume')) {
+        if (!$request->query('draft')) {
+            // ✅ no explicit draft => start fresh wizard session
             $this->resetDraft($request, true);
+        } else {
+            $existingDraft = JobDraft::query()
+                ->where('garage_id', auth()->user()->garage_id)
+                ->where('draft_uuid', $request->query('draft'))
+                ->first();
+
+            if (!$existingDraft || ($existingDraft->status ?? 'draft') !== 'draft') {
+                $this->resetDraft($request, true);
+            }
         }
+
+        $this->persistContext($request);
 
         $draft   = $this->draft($request);
         $isModal = $this->isModal($request);
@@ -321,7 +364,6 @@ class JobCreateWizardController extends Controller
             'modal'      => $isModal,
         ]);
     }
-
     public function postStep1(Request $request, \App\Services\JobDraftService $drafts): JsonResponse|RedirectResponse
     {
         $this->persistContext($request);
@@ -818,6 +860,24 @@ class JobCreateWizardController extends Controller
             $draft = $this->draft($request); // reload after creation
         }
 
+        // ✅ HARD SPLIT: Insurance never uses wizard Step 3.
+        // After Step 2 it must go to Insurance workspace.
+        if (($draft['payer_type'] ?? null) === 'insurance') {
+
+            // Ensure job exists (you already did this above, but keep it safe)
+            if (empty($draft['job_id'])) {
+                $this->ensureDraftJob($request, $draft);
+                $draft = $this->draft($request);
+            }
+
+            if (!empty($draft['job_id'])) {
+                return redirect()->route('jobs.insurance.show', ['job' => (int) $draft['job_id']]);
+            }
+
+            // If something went wrong, bounce back to payer step
+            return redirect()->route('jobs.create.step2', $this->carryContext($request));
+        }
+
         // ✅ Recover vehicle_id into draft if it was passed via query/input but not persisted
         if (empty($draft['vehicle_id'])) {
             $ctx = $this->carryContext($request);
@@ -990,48 +1050,108 @@ class JobCreateWizardController extends Controller
     {
         $this->persistContext($request);
 
-        $request->validate([
+        $validated = $request->validate([
             'job_date'     => ['required', 'date'],
             'mileage'      => ['required', 'numeric', 'min:0'],
             'service_type' => ['required', 'string', 'max:255'],
+
+            // Optional fields captured in Step 3 UI
+            'complaint'   => ['nullable', 'string'],
+            'diagnosis'   => ['nullable', 'string'],
+            'notes'       => ['nullable', 'string'],   // internal notes
+            'work_done'   => ['nullable', 'string'],
+            'labour_cost' => ['nullable', 'numeric', 'min:0'],
+
+            // Parts rows (optional)
+            'part_items'                     => ['nullable', 'array'],
+            'part_items.*.inventory_item_id' => ['nullable', 'integer'],
+            'part_items.*.description'       => ['nullable', 'string'],
+            'part_items.*.quantity'          => ['nullable', 'numeric', 'min:0'],
+            'part_items.*.unit_price'        => ['nullable', 'numeric', 'min:0'],
         ]);
 
-        // Build context
+        // Build context for next routes
         $ctx = $this->carryContext($request);
+        unset($ctx['modal']); // IMPORTANT: strip modal when moving forward (your pattern)
 
-        // 🔥 IMPORTANT: Strip modal when going to Step 4
-        unset($ctx['modal']);
-
-        // Save Step 3 data into draft
+        // Load draft (DB-backed)
         $draft = $this->draft($request);
 
+        // Save step3 details into draft.details (wizard source of truth)
         $draft['details'] = array_merge($draft['details'] ?? [], [
-            'job_date'          => $request->input('job_date'),
-            'mileage'           => $request->input('mileage'),
-            'service_type'      => $request->input('service_type'),
+            'job_date'          => $validated['job_date'],
+            'mileage'           => $validated['mileage'],
+            'service_type'      => $validated['service_type'],
             'unlocked_job_rest' => (bool) $request->input('unlocked_job_rest', false),
+
+            'complaint'   => $request->input('complaint'),
+            'diagnosis'   => $request->input('diagnosis'),
+            'notes'       => $request->input('notes') ?? $request->input('internal_notes'),
+            'work_done'   => $request->input('work_done'),
+            'labour_cost' => $request->input('labour_cost'),
+            'part_items'  => $request->input('part_items', []),
         ]);
 
         $this->putDraft($request, $draft);
 
-        // ✅ Insurance: jump straight into Insurance Workspace (same UI as Jobs > Edit)
+        // ✅ CRITICAL FIX:
+        // If the wizard already created a draft job (ensureDraftJob), update THAT job row now
+        // so Jobs > Edit loads populated fields.
         $draft = $this->draft($request);
-        
-        if (($draft['payer_type'] ?? null) === 'insurance' && !empty($draft['job_id'])) {
+        $jobId = (int) ($draft['job_id'] ?? 0);
+
+        if ($jobId > 0) {
+            $garageId = auth()->user()->garage_id;
+
+            $job = \App\Models\Job::query()
+                ->where('garage_id', $garageId)
+                ->find($jobId);
+
+            if ($job) {
+                $job->fill([
+                    'job_date'     => $validated['job_date'],
+                    'mileage'      => $validated['mileage'],
+                    'service_type' => $validated['service_type'],
+
+                    'complaint'   => $request->input('complaint'),
+                    'diagnosis'   => $request->input('diagnosis'),
+                    'notes'       => $request->input('notes') ?? $request->input('internal_notes'),
+                    'work_done'   => $request->input('work_done'),
+                    'labour_cost' => $request->input('labour_cost'),
+                ]);
+
+                // Keep job as draft until confirm/finalize (don’t burn job_number here)
+                if (empty($job->status)) {
+                    $job->status = 'draft';
+                }
+
+                $job->save();
+
+                // Sync part items into DB too (so edit page shows them)
+                $partItems = $request->input('part_items', []);
+                if (is_array($partItems) && count($partItems)) {
+                    app(\App\Http\Controllers\JobController::class)->syncJobPartItems($job, $partItems);
+                }
+            }
+        }
+
+        // ✅ Insurance: jump straight into Insurance Workspace (same UI as Jobs > Edit)
+        if (($draft['payer_type'] ?? null) === 'insurance' && $jobId > 0) {
             return $this->modalNext(
                 $request,
-                route('jobs.insurance.show', ['job' => (int) $draft['job_id']])
+                route('jobs.insurance.show', ['job' => $jobId])
             );
         }
 
-        // Default: continue existing wizard finish/review
+        // Always carry draft UUID forward
+        $ctx['draft'] = $draft['draft_uuid'];
+
+        // Default: continue to Step 4
         return $this->modalNext(
             $request,
             route('jobs.create.step4', $ctx)
         );
-
     }
-
     /*
     |--------------------------------------------------------------------------
     | STEP 4 (Review / Success)
@@ -1047,10 +1167,18 @@ class JobCreateWizardController extends Controller
         $draft = $this->draft($request);
 
         // If you later create the job on Step 4 confirm, you'll set last_job_id.
+        // But Step 3 already creates a draft job_id — so Step 4 must support both.
         $job = null;
-        if (!empty($draft['last_job_id'])) {
+
+        $jobId = (int) (
+            $draft['last_job_id']
+            ?? $draft['job_id']
+            ?? 0
+        );
+
+        if ($jobId > 0) {
             $job = Job::where('garage_id', auth()->user()->garage_id)
-                ->find($draft['last_job_id']);
+                ->find($jobId);
         }
 
         return view($view, [
@@ -1115,6 +1243,12 @@ class JobCreateWizardController extends Controller
             'labour_cost'  => $details['labour_cost'] ?? $request->input('labour_cost'),
             'part_items'   => $details['part_items']  ?? $request->input('part_items', []),
             'notes'        => $details['notes']       ?? $request->input('notes'),
+            'complaint'   => $details['complaint'] ?? $request->input('complaint'),
+            'diagnosis'   => $details['diagnosis'] ?? $request->input('diagnosis'),
+            'work_done'   => $details['work_done'] ?? $request->input('work_done'),
+            'notes'       => $details['notes'] ?? $request->input('notes'),
+            'labour_cost' => $details['labour_cost'] ?? $request->input('labour_cost'),
+            'part_items'  => $details['part_items'] ?? $request->input('part_items', []),
         ]);
 
         // ------------------------------------------------------------
@@ -1198,9 +1332,20 @@ class JobCreateWizardController extends Controller
                         'status'         => $payload['status'] ?? 'pending',
                     ]);
 
-                    // Enforce payer context on finalize too
-                    if (isset($payload['payer_type'])) {
-                        $job->payer_type = $payload['payer_type'];
+                    $draftPayerType = (string) ($draft['payer_type'] ?? '');
+                    if ($draftPayerType === '') {
+                        throw new \RuntimeException('Draft has no payer_type.');
+                    }
+
+                    if (!empty($job->payer_type) && $job->payer_type !== $draftPayerType) {
+                        throw new \RuntimeException("Payer mismatch: job={$job->payer_type}, draft={$draftPayerType}");
+                    }
+
+                    if (empty($job->payer_type)) {
+                        $job->payer_type = $draftPayerType;
+                    }
+                    if ($draftPayerType === 'insurance' && isset($payload['insurance'])) {
+                        $jobController->syncInsuranceDetailsForJob(...);
                     }
                     if (array_key_exists('organization_id', $payload)) {
                         $job->organization_id = $payload['organization_id'];
@@ -1255,13 +1400,27 @@ class JobCreateWizardController extends Controller
             $this->putDraft($request, $draft);
         }
 
+        // ✅ lock draft after successful confirm
+        \DB::table('job_drafts')
+        ->where('garage_id', auth()->user()->garage_id)
+        ->where('draft_uuid', $draft['draft_uuid'])
+        ->update([
+            'status' => 'completed',
+            'last_step' => 'committed',
+            'updated_at' => now(),
+        ]);
         // ✅ Insurance goes straight into the Insurance Workspace (full page)
         if (($draft['payer_type'] ?? null) === 'insurance' && $job) {
             return $this->modalNext($request, route('jobs.insurance.show', ['job' => $job->id]));
         }
 
-        // Default: continue existing wizard finish/review
-        return $this->modalNext($request, route('jobs.create.step4', $ctx));
+        // ✅ For Individual / Company: go to Job Details (show) — NOT edit, NOT step4
+        if ($job) {
+            return $this->modalNext($request, route('jobs.show', ['job' => $job->id]));
+        }
+
+        // Safety fallback (should rarely happen)
+        return $this->modalNext($request, route('jobs.index'));
     }
 
 
@@ -1745,6 +1904,9 @@ class JobCreateWizardController extends Controller
         // ✅ Always use DB draft as the source of truth
         $d = $this->ensureDbDraft($request);
 
+        if (($d->status ?? 'draft') !== 'draft') {
+            throw new \RuntimeException('Draft is locked and cannot be modified.');
+        }
         // Already linked? nothing to do.
         if (!empty($d->job_id)) {
             return;
@@ -2256,27 +2418,7 @@ class JobCreateWizardController extends Controller
 
     private function resetDraft(Request $request, bool $keepContext = true): void
     {
-        $existing = $this->draft($request);
-
-        $fresh = [
-            'customer_id' => $keepContext ? ($existing['customer_id'] ?? null) : null,
-            'vehicle_id'  => $keepContext ? ($existing['vehicle_id'] ?? null) : null,
-            'modal'       => $keepContext ? ($existing['modal'] ?? null) : null,
-            'last_job_id' => null,
-
-            'payer_type'  => null,
-            'payer'       => [],
-            'details'     => [],
-
-            // ✅ CRITICAL: ALWAYS reset inspection anchor for a NEW wizard session
-            // Otherwise checklist/photos bleed into next job.
-            'inspection_id' => null,
-
-            // ✅ CRITICAL: ALWAYS generate a new draft UUID for a NEW wizard session
-            'draft_uuid' => (string) \Illuminate\Support\Str::uuid(),
-        ];
-
-        $this->putDraft($request, $fresh);
+        $this->createFreshDraft($request, $keepContext);
     }
 
     private function finalizeDraftJob(Request $request, array $draft): Job
@@ -2325,9 +2467,24 @@ class JobCreateWizardController extends Controller
             ]);
 
             // Payer context (already mostly set at draft create time, but safe to enforce)
-            $job->payer_type = $payload['payer_type'] ?? $job->payer_type;
+            //$job->payer_type = $payload['payer_type'] ?? $job->payer_type;
             $job->organization_id = $payload['organization_id'] ?? $job->organization_id;
 
+            // Canonical payer_type must come from the draft record (not request payload)
+            $draftPayerType = (string) ($draft['payer_type'] ?? '');
+            if ($draftPayerType === '') {
+                throw new \RuntimeException('Draft has no payer_type.');
+            }
+
+            // If job already has a payer_type and it differs => stop and surface bug
+            if (!empty($job->payer_type) && $job->payer_type !== $draftPayerType) {
+                throw new \RuntimeException("Payer mismatch: job={$job->payer_type}, draft={$draftPayerType}");
+            }
+
+            // If job payer_type is empty (shouldn’t be), set it from draft
+            if (empty($job->payer_type)) {
+                $job->payer_type = $draftPayerType;
+            }
             $job->save();
 
             // Sync insurance details using your existing canonical method

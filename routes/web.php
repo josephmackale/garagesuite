@@ -101,9 +101,7 @@ Route::post('/payments/mpesa/stk/callback', [MpesaCallbackController::class, 'st
 Route::middleware(['web','auth'])
   ->post('/invoices/{invoice}/payments/manual', [InvoicePaymentsController::class, 'storeManual'])
   ->name('invoices.payments.manual');
-  
-Route::post('jobs/{job}/insurance/claim/submit', [\App\Http\Controllers\Insurance\InsuranceClaimController::class, 'submit'])
-    ->name('jobs.insurance.claim.submit'); 
+
   
 // -------------------------------------------
 // ✅ SETTINGS (AUTH ONLY) — OUTSIDE subscription.mode
@@ -354,51 +352,11 @@ Route::prefix('jobs/create')->name('jobs.create.')->group(function () {
     Route::post('confirm', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'confirm'])
         ->name('confirm');
 
-    Route::post('step3/inspection/save', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionSave'])
-        ->name('step3.inspection.save');
-
-    Route::post('step3/inspection/photo', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionPhoto'])
-        ->name('step3.inspection.photo');
-
-    Route::post('step3/inspection/complete', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionComplete'])
-        ->name('step3.inspection.complete');
-
-    // Vault Picker (Inspection)
-    Route::get('step3/vault', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'vaultPicker'])
-        ->name('step3.vault');
-
-    Route::post('step3/vault/upload', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'vaultUpload'])
-        ->name('step3.vault.upload');
-
-    Route::post('step3/vault/attach', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'vaultAttachToInspection'])
-        ->name('step3.vault.attach');
-
-    // Checklist (Inspection)
-    Route::get('step3/inspection/checklist', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionChecklistLoad'])
-        ->name('step3.inspection.checklist');
-
-    Route::post('step3/inspection/checklist', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionChecklistSave'])
-        ->name('step3.inspection.checklist.save');
-
-    Route::get('step3/inspection/checklist', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'inspectionChecklistLoad'])
-        ->name('step3.inspection.checklist');
-
-    Route::post('step3/vault/detach', [\App\Http\Controllers\Jobs\JobCreateWizardController::class, 'vaultDetachFromInspection'])
-    ->name('step3.vault.detach');
-
-    Route::get('step-3/quotation', [JobCreateWizardController::class, 'step3Quotation'])
-        ->name('step3.quotation');
-
-    Route::post('step3/quotation/save', [JobCreateWizardController::class, 'saveQuotation'])
-        ->name('step3.quotation.save'); 
-
     Route::get('resume', [JobCreateWizardController::class, 'resume'])
         ->name('resume');
 
     Route::post('draft/save', [JobCreateWizardController::class, 'saveDraft'])
         ->name('draft.save');
-
-
 });
 
 // -----------------------------
@@ -479,8 +437,7 @@ Route::prefix('jobs/{job}/insurance')
         Route::post('claim/submit', [InsuranceClaimController::class, 'submit'])->name('claim.submit');
     });
 
-    Route::resource('jobs',      JobController::class);
-
+Route::resource('jobs', JobController::class)->except(['create']);
     // Job Card (HTML)
     Route::get('/jobs/{job}/job-card', [JobController::class, 'jobCard'])
         ->name('jobs.job-card');

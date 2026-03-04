@@ -34,10 +34,16 @@
 
             {{-- Actions --}}
             <div class="mt-8 flex flex-wrap items-center gap-3">
-                <a href="{{ route('jobs.show', $job) }}"
-                   class="inline-flex items-center gap-2 px-4 py-2 rounded-xl
-                          bg-indigo-600 text-white font-semibold
-                          hover:bg-indigo-700 transition">
+                @php
+                    $isInsurance = ($job->payer_type ?? null) === 'insurance';
+                @endphp
+
+                <a href="{{ $isInsurance 
+                            ? route('jobs.insurance.show', $job) 
+                            : route('jobs.edit', $job) }}"
+                class="inline-flex items-center gap-2 px-4 py-2 rounded-xl
+                        bg-indigo-600 text-white font-semibold
+                        hover:bg-indigo-700 transition">
                     View Job
                 </a>
 
@@ -64,6 +70,10 @@
         ============================================================ --}}
         @else
             @php
+
+                $ctx = $ctx ?? [];
+                $ctx['draft'] = $draft['draft_uuid'] ?? ($ctx['draft'] ?? request('draft'));
+                
                 // Provided by controller patch: $draft + $details
                 $payerType = $draft['payer_type'] ?? null;
                 $payer     = $draft['payer'] ?? [];

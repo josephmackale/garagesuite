@@ -185,14 +185,10 @@ class ApprovalPackController extends Controller
             // ✅ Now submit using your existing generator (status/version/submitted_at logic stays centralized)
             $submittedPack = $generator->submit($lockedPack);
 
-            return response()->json([
-                'ok' => true,
-                'pack' => [
-                    'id' => $submittedPack->id,
-                    'status' => $submittedPack->status,
-                    'submitted_at' => optional($submittedPack->submitted_at)->toDateTimeString(),
-                ],
-            ]);
+            return redirect()
+                ->route('jobs.insurance.show', $jobId)
+                ->with('success', 'Approval pack submitted.');
+                
         });
     }
 

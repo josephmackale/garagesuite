@@ -878,6 +878,9 @@ class JobController extends Controller
     */
     protected function validateRequest(Request $request): array
     {
+        $request->merge([
+            'status' => strtolower(trim((string) $request->input('status', 'pending')))
+        ]);
         $garageId = Auth::user()->garage_id;
 
         $data = $request->validate([
@@ -900,8 +903,7 @@ class JobController extends Controller
             'notes'     => ['nullable', 'string'],
             'work_done' => ['nullable', 'string'],
 
-            'status'      => ['nullable', 'in:pending,in_progress,completed,cancelled'],
-            'labour_cost' => ['nullable', 'numeric', 'min:0'],
+            'status' => ['nullable', 'in:pending,in_progress,completed,cancelled,draft'],            'labour_cost' => ['nullable', 'numeric', 'min:0'],
 
             // ✅ payer context
             'payer_type' => ['required', Rule::in(['individual', 'company', 'insurance'])],
@@ -928,6 +930,9 @@ class JobController extends Controller
             'part_items.*.unit_price'  => ['nullable', 'numeric', 'min:0'],
         ]);
 
+        if (($data['status'] ?? null) === 'draft') {
+            $data['status'] = 'pending';
+        }
         // ==========================
         // Phase 2 hard invariants
         // ==========================
@@ -1002,6 +1007,16 @@ class JobController extends Controller
     {
         $current   = (string) ($job->status ?? 'pending');
         $requested = (string) ($data['status'] ?? $current);
+
+        // ✅ Normalize legacy 'draft' to behave like 'pending'
+        if ($current === 'draft') {
+            $current = 'pending';
+        }
+        if ($requested === 'draft') {
+            $requested = 'pending';
+        }
+
+            $data['status'] = $requested;
 
         if (in_array($current, ['completed', 'cancelled'], true)) {
             if ($requested !== $current) {

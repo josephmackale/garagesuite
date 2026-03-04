@@ -18,6 +18,7 @@
         'customer_id' => request('customer_id'),
         'vehicle_id'  => request('vehicle_id'),
         'modal'       => request('modal'),
+        'draft' => request('draft') ?? ($draft['draft_uuid'] ?? null),
     ], fn($v) => $v !== null && $v !== '');
 
     $payerType = $payer_type ?? null;
@@ -330,6 +331,10 @@
     >
         @csrf
 
+        @if(!empty($draft['draft_uuid']))
+            <input type="hidden" name="draft" value="{{ $draft['draft_uuid'] }}">
+        @endif
+
         {{-- keep wizard context --}}
         @if(!empty($customerId))
             <input type="hidden" name="customer_id" value="{{ $customerId }}">
@@ -527,13 +532,6 @@
                         'draft'      => $draft,
                         'inspection' => $inspection,
                         'ctx'        => $ctx,
-                    ])
-
-                    {{-- ✅ ADD THIS: Quotation card right after inspection --}}
-                    @include('jobs.insurance.quotation.card', [
-                        'job'       => $job ?? null,
-                        'inspection'=> $inspection ?? null,
-                        'quote'     => $quote ?? null,   {{-- if not available yet, fine --}}
                     ])
                 </div>
             @endif

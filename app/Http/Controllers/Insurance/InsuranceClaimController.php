@@ -418,25 +418,28 @@ class InsuranceClaimController extends Controller
         $claim->pack_path          = $zipRelPath;
         $claim->save();
 
-        return [$zipAbsPath, $zipName, $zipRelPath];
+        return [
+            'abs' => $zipAbsPath,
+            'name' => $zipName,
+            'rel' => $zipRelPath,
+        ];
     }
 
     public function generatePack(Job $job, InsuranceGate $gate)
     {
         $garageId = (int) $job->garage_id;
 
-        // ✅ must have claim row (your contract)
-        $claim = InsuranceClaim::query()
-            ->where('garage_id', $garageId)
-            ->where('job_id', (int) $job->id)
-            ->first();
-
-        if (!$claim) {
-            return redirect()
-                ->route('jobs.insurance.claim.show', $job->id)
-                ->with('error', 'Submit claim before generating claim pack.');
-        }
-
+        // ✅ Ensure claim row exists (auto-create draft on first generate)
+        $claim = \App\Models\InsuranceClaim::firstOrCreate(
+            [
+                'garage_id' => $garageId,
+                'job_id'    => (int) $job->id,
+            ],
+            [
+                'status'       => 'draft',
+                'submitted_at' => null,
+            ]
+        );
         // ✅ Build the zip (make buildClaimPackZip RETURN the zip path + filename if possible)
         // We’ll support both: (a) returns string path, or (b) returns ['path'=>..,'filename'=>..]
         $result = $this->buildClaimPackZip($job, $gate);
@@ -447,10 +450,11 @@ class InsuranceClaimController extends Controller
         if (is_string($result)) {
             $zipPath = $result;
             $zipFilename = basename($result);
-        } elseif (is_array($result)) {
-            $zipPath = $result['path'] ?? null;
-            $zipFilename = $result['filename'] ?? ($zipPath ? basename($zipPath) : null);
-        }
+            } elseif (is_array($result)) {
+                // support buildClaimPackZip() current return shape
+                $zipPath = $result['rel'] ?? ($result['path'] ?? null);
+                $zipFilename = $result['name'] ?? ($result['filename'] ?? ($zipPath ? basename($zipPath) : null));
+            }
 
         // ✅ If builder didn’t return anything, we still proceed but won’t write pack fields.
         // (Better to update buildClaimPackZip to return path.)
